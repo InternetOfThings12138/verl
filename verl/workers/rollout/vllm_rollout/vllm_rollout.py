@@ -45,6 +45,13 @@ from vllm.config import LoRAConfig
 
 from verl.utils.ray_utils import get_event_loop
 
+import tempfile
+import subprocess
+import shutil
+from pathlib import Path
+from typing import Tuple, Generator, Dict, Any
+from omegaconf import OmegaConf
+
 try:
     from vllm.worker.worker_base import WorkerWrapperBase
 except ModuleNotFoundError:
@@ -133,6 +140,12 @@ class vLLMAsyncRollout(BaseRollout):
             self.sleep_level = 1
         else:
             self.sleep_level = VLLM_SLEEP_LEVEL
+
+        self.model_original_path = model_config.path
+        self.model_local_path = model_config.local_path
+        self.ms_modelslim_path = os.environ.get("MS_MODELSLIM_PATH", "msmodelslim")
+        self._quant_cache = {}  # 量化缓存
+        self._last_quant_path = None
 
     def _init_zeromq(self) -> str:
         tensor_parallel_size = self.config.tensor_model_parallel_size
@@ -238,6 +251,54 @@ class vLLMAsyncRollout(BaseRollout):
             weights: A generator that yields the name of the weight tensor and the tensor itself.
         """
         peft_config, base_sync_done = kwargs.get("peft_config", None), kwargs.get("base_sync_done", False)
+        
+        # mxfp8_config = getattr(self.config, 'w8a8_quantization', None)
+        # # mxfp8_config = getattr(self.config, 'mxfp8_quantization', None)
+        # is_mxfp8_enabled = mxfp8_config and mxfp8_config.enabled and not peft_config
+
+        mxfp8_config = self.config.get('w8a8_quantization', {})  # 获取字典
+    
+        # 安全访问 enabled 属性（处理 dict 和对象两种情况）
+        is_mxfp8_enabled = False
+        if mxfp8_config:
+            if isinstance(mxfp8_config, dict):
+                is_mxfp8_enabled = mxfp8_config.get('enabled', False)
+            else:  # 如果是对象
+                is_mxfp8_enabled = getattr(mxfp8_config, 'enabled', False)
+        
+        # 检查是否是基础模型同步（不是 LoRA）
+        is_mxfp8_enabled = is_mxfp8_enabled and not peft_config
+        
+        # if is_mxfp8_enabled:
+        #     logger.info(f"MXFP8 quantization enabled, applying to base model weights")
+        #     # 将权重生成器包装为量化生成器
+        #     weights = self._quantize_weights_mxfp8(weights, mxfp8_config)
+
+        if is_mxfp8_enabled:
+            logger.info("W8A8 quantization enabled via msit, processing weights...")
+
+            # 1. 将权重保存为临时 checkpoint（msmodelslim 需要路径输入）
+            with tempfile.TemporaryDirectory(prefix="verl_w8a8_") as tmpdir:
+                weights_dict = dict(weights)  # 收集权重
+                checkpoint_path = Path(tmpdir) / "model_before_w8a8"
+                print(f"=================checkpoint_path:{checkpoint_path}================")
+                
+                # 保存为 HF 格式（msmodelslim 支持）
+                self._save_weights_as_hf_checkpoint(weights_dict, checkpoint_path)
+                
+                # 2. 调用 msit 量化
+                quantized_path = Path(tmpdir) / "model_w8a8"
+                print(f"=================quantized_path:{quantized_path}================")
+                self._run_msit_quantization(
+                    input_path=checkpoint_path,
+                    output_path=quantized_path,
+                    config=mxfp8_config
+                )
+                
+                
+                # 3. 加载量化后的权重
+                weights = self._load_quantized_weights(quantized_path)
+
         if peft_config and base_sync_done:
             # In async mode, make sure the old lora is removed before adding the new one
             self.inference_engine.worker.remove_lora(VLLM_LORA_INT_ID)
@@ -260,7 +321,11 @@ class vLLMAsyncRollout(BaseRollout):
 
             # Add the FP8 related logic here as sharding manager has been deprecated.
             # Check if FP8 quantization is enabled and apply appropriate weight loading
-            if is_fp8_model(model_runner.vllm_config):
+
+            if is_mxfp8_enabled:
+                logger.info("Loading MXFP8 quantized weights directly")
+                model.load_weights(weights)
+            elif is_fp8_model(model_runner.vllm_config):
                 logger.info(f"FP8 model detected (async): {model_runner.vllm_config.quant_config}")
                 # Convert bf16 weights to fp8 format before loading
                 loaded_params = load_quanted_weights(weights, model_runner)
@@ -291,3 +356,139 @@ class vLLMAsyncRollout(BaseRollout):
 
     def get_zeromq_address(self):
         return self.address
+
+
+    def _save_weights_as_hf_checkpoint(self, weights_dict: Dict[str, torch.Tensor], save_path: Path):
+        """
+        将权重字典保存为 HuggingFace checkpoint 格式
+        """
+        save_path.mkdir(parents=True, exist_ok=True)
+        
+        # 分离权重和 scale（如果已量化）
+        state_dict = {}
+        for name, tensor in weights_dict.items():
+            # 跳过 scale（msmodelslim 会从配置文件读取）
+            if name.endswith("_scale"):
+                continue
+            state_dict[name] = tensor
+        
+        # 保存权重
+        torch.save(state_dict, save_path / "pytorch_model.bin")
+        
+        # 复制配置文件（从本地路径）
+        if self.model_local_path:
+            config_files = ["config.json", "tokenizer_config.json", "tokenizer.json"]
+            for cfg_file in config_files:
+                src = Path(self.model_local_path) / cfg_file
+                if src.exists():
+                    shutil.copy2(src, save_path / cfg_file)
+
+    def _run_msit_quantization(self, input_path: Path, output_path: Path, config: Any):
+        """
+        调用 msit 命令行进行 W8A8 量化
+        
+        Args:
+            input_path: 输入模型路径（HuggingFace 格式）
+            output_path: 量化后模型保存路径
+            config: 量化配置对象
+        """
+        # 构建 msit 命令
+        cmd = [
+            self.ms_modelslim_path,  # 如 "python -m msit" 或 "msmodelslim"
+            "quant",
+            "--model_path", str(input_path),
+            "--save_path", str(output_path),
+            "--device", "npu",  # 或 "cpu", "gpu"
+            "--model_type", self.model_config.architectures[0],  # 从配置读取，如 "Qwen2ForCausalLM"
+            "--quant_type", "w8a8",
+            "--trust_remote_code", "True",
+        ]
+        
+        # 可选参数
+        if hasattr(config, 'calibration_samples') and config.calibration_samples > 0:
+            cmd.extend(["--calibration_samples", str(config.calibration_samples)])
+        
+        # 执行量化
+        logger.info(f"Running msit quantization: {' '.join(cmd)}")
+        try:
+            result = subprocess.run(
+                cmd,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=600  # 10分钟超时
+            )
+            logger.info(f"msit quantization succeeded: {result.stdout}")
+        except subprocess.CalledProcessError as e:
+            logger.error(f"msit quantization failed: {e.stderr}")
+            raise RuntimeError(f"W8A8 quantization failed: {e.stderr}")
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("W8A8 quantization timed out after 10 minutes")
+
+    def _load_quantized_weights(self, quantized_path: Path) -> Generator[Tuple[str, torch.Tensor], None, None]:
+        """
+        加载量化后的权重文件（mt-safe-tensors 格式）
+        
+        Returns:
+            权重生成器，符合 vLLM load_weights 接口
+        """
+        # msit 可能生成 .safetensors 或 .bin
+        weight_files = list(quantized_path.glob("*.safetensors")) or list(quantized_path.glob("pytorch_model.bin"))
+        
+        if not weight_files:
+            raise FileNotFoundError(f"No weight files found in {quantized_path}")
+        
+        # 加载权重
+        state_dict = {}
+        for wf in weight_files:
+            if wf.suffix == ".safetensors":
+                from safetensors import safe_open
+                with safe_open(wf, framework="pt", device="cpu") as f:
+                    for key in f.keys():
+                        state_dict[key] = f.get_tensor(key)
+            else:
+                state_dict.update(torch.load(wf, map_location="cpu"))
+        
+        # 生成器形式返回
+        for name, tensor in state_dict.items():
+            yield name, tensor
+
+
+    def _quantize_weights_mxfp8(self, weights: Generator[Tuple[str, torch.Tensor], None, None], config) -> Generator[Tuple[str, torch.Tensor], None, None]:
+        """
+        动态将权重转换为 MXFP8 格式（per-channel 量化）
+        
+        Args:
+            weights: 原始权重生成器，产生 (name, tensor) 对
+            config: MXFP8 量化配置对象
+        
+        Returns:
+            量化后的权重生成器，产生 (name, q_tensor) 和 (name_scale, scale)
+        """
+        ignore_modules = getattr(config, 'ignore_modules', ["lm_head", "embed_tokens"])
+        quantize_dtype = torch.float8_e4m3fn  # MXFP8 使用 E4M3 格式
+        
+        for name, tensor in weights:
+            # 判断是否需要量化：跳过指定模块和非 2D 权重
+            if any(ignore in name for ignore in ignore_modules) or tensor.dim() != 2:
+                yield name, tensor
+                continue
+            
+            # Per-channel 量化：每个输出通道一个缩放因子
+            # FP8 E4M3 范围: -448 到 448
+            fp8_max = 448.0
+            scale = tensor.abs().max(dim=0, keepdim=True)[0] / fp8_max
+            scale = scale.clamp(min=1e-12)  # 防止除零
+            
+            # 执行量化（无梯度跟踪）
+            with torch.no_grad():
+                q_tensor = (tensor / scale).clamp(-fp8_max, fp8_max).to(quantize_dtype)
+                scale_fp32 = scale.squeeze(0).to(torch.float32)
+            
+            # 返回量化权重和缩放因子（vLLM 期望的格式）
+            yield name, q_tensor
+            yield f"{name}_scale", scale_fp32
+            
+            # 可选：清理缓存以节省显存
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()

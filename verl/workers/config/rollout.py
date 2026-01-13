@@ -116,6 +116,20 @@ class PrometheusConfig(BaseConfig):
     # Specify served_model_name to avoid displaying overly long model paths in Grafana
     served_model_name: Optional[str] = None
 
+@dataclass
+class W8A8QuantizationConfig(BaseConfig):
+    enabled: bool = False
+    msit_path: str = "msmodelslim"  # msit 命令路径
+    calibration_samples: int = 128
+    ignore_modules: list = field(default_factory=lambda: ["lm_head", "embed_tokens"])
+
+@dataclass 
+class MXFP8QuantizationConfig(BaseConfig):
+    enabled: bool = False
+    scheme: str = "MXFP8"  # MXFP8, 或 W8A8
+    ignore_modules: list = field(default_factory=lambda: ["lm_head", "embed_tokens", "lm_head.weight"])
+    per_channel: bool = True
+    calibration_steps: int = 0  # 0 表示动态量化，不使用校准
 
 @dataclass
 class RolloutConfig(BaseConfig):
@@ -218,6 +232,9 @@ class RolloutConfig(BaseConfig):
     enable_rollout_routing_replay: bool = False
 
     enable_sleep_mode: bool = True
+
+    w8a8_quantization: W8A8QuantizationConfig = field(default_factory=W8A8QuantizationConfig)
+    mxfp8_quantization: MXFP8QuantizationConfig = field(default_factory=MXFP8QuantizationConfig)
 
     def __post_init__(self):
         """Validate the rollout config"""

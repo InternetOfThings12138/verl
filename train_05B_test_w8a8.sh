@@ -14,6 +14,9 @@ export VERL_FILE_LOGGER_ROOT="/home/f00939291/verl/verl/outputs2"
 #option = {"ACL_PRECISION_MODE":"must_keep_origin_dtype"}
 #torch_npu.npu.set_option(option)
 
+
+# export MS_MODELSLIM_PATH="msmodelslim"
+
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     data.train_files=/home/f00939291/dataset/train.parquet \
@@ -44,6 +47,11 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.n=8 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.ref.fsdp_config.param_offload=False \
+    +actor_rollout_ref.rollout.w8a8_quantization.enabled=True \
+    +actor_rollout_ref.rollout.w8a8_quantization.msit_path="python -m modelslim.cli" \
+    +actor_rollout_ref.rollout.w8a8_quantization.calibration_samples=128 \
+    +actor_rollout_ref.rollout.w8a8_quantization.ignore_modules="['lm_head','embed_tokens']" \
+    +actor_rollout_ref.rollout.w8a8_quantization.smoothing_strength=0.8 \
     algorithm.kl_ctrl.kl_coef=0.0 \
     trainer.critic_warmup=0 \
     trainer.logger=console \
@@ -54,6 +62,6 @@ python3 -m verl.trainer.main_ppo \
     trainer.save_freq=-1 \
     trainer.test_freq=10 \
     trainer.total_epochs=2 \
-    trainer.total_training_steps=1 \
+    trainer.total_training_steps=2 \
     trainer.device=npu $@
     
