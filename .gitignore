@@ -128,3 +128,17 @@ logs
 log
 outputs
 .history
+.gitignore
+.*
+CONTRIBUTING.md
+LICENSE
+Notice.txt
+README.md
+docker/
+docs/
+examples/
+pyproject.toml
+requirements*
+setup.py
+scripts/
+tests/
