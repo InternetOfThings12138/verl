@@ -3,7 +3,7 @@ set -x
 export VLLM_ASCEND_ENABLE_NZ=0
 export TORCHDYNAMO_VERBOSE=1
 export HYDRA_FULL_ERROR=1
-# export ASCEND_RT_VISIBLE_DEVICES=8
+export ASCEND_RT_VISIBLE_DEVICES=5
 # export VLLM_ATTENTION_BACKEND=XFORMERS
 export VERL_FILE_LOGGER_ROOT="/home/f00939291/verl/verl/outputs2"
 # export HF_HUB_OFFLINE=true
@@ -48,7 +48,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.ref.fsdp_config.param_offload=False \
     +actor_rollout_ref.rollout.w8a8_quantization.enabled=True \
-    +actor_rollout_ref.rollout.w8a8_quantization.msit_path="python -m modelslim.cli" \
+    +actor_rollout_ref.rollout.w8a8_quantization.msit_path="msmodelslim" \
     +actor_rollout_ref.rollout.w8a8_quantization.calibration_samples=128 \
     +actor_rollout_ref.rollout.w8a8_quantization.ignore_modules="['lm_head','embed_tokens']" \
     +actor_rollout_ref.rollout.w8a8_quantization.smoothing_strength=0.8 \

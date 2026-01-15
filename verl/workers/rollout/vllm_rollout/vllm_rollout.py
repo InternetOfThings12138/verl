@@ -52,6 +52,11 @@ from pathlib import Path
 from typing import Tuple, Generator, Dict, Any
 from omegaconf import OmegaConf
 
+# from vllm.logger import init_logger
+from safetensors.torch import save_file, load_file
+
+# logger = init_logger(__name__)
+
 try:
     from vllm.worker.worker_base import WorkerWrapperBase
 except ModuleNotFoundError:
@@ -78,7 +83,7 @@ from verl.workers.rollout.vllm_rollout.utils import (
 )
 
 logger = logging.getLogger(__file__)
-logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 # TODO
 # 1. support pp in vllm
@@ -204,7 +209,7 @@ class vLLMAsyncRollout(BaseRollout):
             lora_dtype = getattr(torch, self.config.dtype)
             self.vllm_config.lora_config = LoRAConfig(lora_dtype=lora_dtype, **self.lora_config)
         if self.config.quantization is not None:
-            _SUPPORTED_QUANTIZATION = ["fp8", "torchao"]
+            _SUPPORTED_QUANTIZATION = ["fp8", "torchao", "ascend"]
             if self.config.quantization not in _SUPPORTED_QUANTIZATION:
                 raise ValueError(
                     f"Currently only support {_SUPPORTED_QUANTIZATION} quantization, got: {self.config.quantization}"
@@ -274,6 +279,7 @@ class vLLMAsyncRollout(BaseRollout):
         #     # 将权重生成器包装为量化生成器
         #     weights = self._quantize_weights_mxfp8(weights, mxfp8_config)
 
+        """
         if is_mxfp8_enabled:
             logger.info("W8A8 quantization enabled via msit, processing weights...")
 
@@ -295,9 +301,44 @@ class vLLMAsyncRollout(BaseRollout):
                     config=mxfp8_config
                 )
                 
+                print(f"=================quantized_path:{quantized_path}================2")
                 
                 # 3. 加载量化后的权重
                 weights = self._load_quantized_weights(quantized_path)
+
+                print(f"=================quantized_path:{quantized_path}================end")
+        """
+        if is_mxfp8_enabled:
+            logger.info("W8A8 quantization enabled via msit, processing weights...")
+
+            # 1. 将权重保存为临时 checkpoint（msmodelslim 需要路径输入）
+            with tempfile.TemporaryDirectory(prefix="verl_w8a8_") as tmpdir:
+                weights_dict = dict(weights)  # 收集权重
+                checkpoint_path = Path(tmpdir) / "model_before_w8a8"
+                print(f"=================checkpoint_path:{checkpoint_path}================")
+                
+                # 保存为 HF 格式（msmodelslim 支持）
+                self._save_weights_as_hf_checkpoint(weights_dict, checkpoint_path)
+                
+                # 2. 调用 msit 量化
+                quantized_path = Path(tmpdir) / "model_w8a8"
+                print(f"=================quantized_path:{quantized_path}================")
+                self._run_msit_quantization(
+                    input_path=checkpoint_path,
+                    output_path=quantized_path,
+                    config=mxfp8_config
+                )
+                
+                print(f"=================quantized_path:{quantized_path}================2")
+                
+                # 3. 关键修改：立即加载权重到内存（列表化）
+                # 在上下文管理器中完成所有文件操作
+                weights_list = list(self._load_quantized_weights(quantized_path))
+                
+                print(f"=================quantized_path:{quantized_path}================end")
+            
+            # 4. 在上下文管理器外创建生成器
+            weights = (item for item in weights_list)
 
         if peft_config and base_sync_done:
             # In async mode, make sure the old lora is removed before adding the new one
@@ -358,30 +399,150 @@ class vLLMAsyncRollout(BaseRollout):
         return self.address
 
 
-    def _save_weights_as_hf_checkpoint(self, weights_dict: Dict[str, torch.Tensor], save_path: Path):
+    def _save_weights_as_hf_checkpoint(
+        self, 
+        weights_dict: Dict[str, torch.Tensor], 
+        save_path: Path
+    ):
         """
-        将权重字典保存为 HuggingFace checkpoint 格式
+        保存权重为 HuggingFace checkpoint 格式
+        msit 要求输入为 BF16/FP32，因此不在这里量化
         """
         save_path.mkdir(parents=True, exist_ok=True)
         
-        # 分离权重和 scale（如果已量化）
-        state_dict = {}
-        for name, tensor in weights_dict.items():
-            # 跳过 scale（msmodelslim 会从配置文件读取）
-            if name.endswith("_scale"):
-                continue
-            state_dict[name] = tensor
+        # 移除 scale（msit 会重新计算）
+        state_dict = {
+            name: tensor for name, tensor in weights_dict.items()
+            if not name.endswith("_scale")
+        }
         
-        # 保存权重
-        torch.save(state_dict, save_path / "pytorch_model.bin")
+        # 使用 safetensors 保存（更快，更安全）
+        save_file(state_dict, save_path / "model.safetensors")
         
-        # 复制配置文件（从本地路径）
-        if self.model_local_path:
-            config_files = ["config.json", "tokenizer_config.json", "tokenizer.json"]
-            for cfg_file in config_files:
-                src = Path(self.model_local_path) / cfg_file
-                if src.exists():
-                    shutil.copy2(src, save_path / cfg_file)
+        # 复制所有模型文件
+        self._copy_model_files(save_path)
+
+    def _copy_model_files(self, save_path: Path):
+        """复制模型所有相关文件"""
+        if not (hasattr(self, 'model_local_path') and self.model_local_path):
+            logger.warning("No model_local_path found, cannot copy config files")
+            return
+        
+        model_src = Path(self.model_local_path)
+        
+        # 1. 复制所有 JSON 配置文件
+        for json_file in model_src.glob("*.json"):
+            shutil.copy2(json_file, save_path / json_file.name)
+        
+        # 2. 复制 tokenizer 相关文件
+        tokenizer_files = [
+            "tokenizer.json", "tokenizer_config.json", "vocab.json",
+            "vocab.txt", "merges.txt", "special_tokens_map.json",
+            "tokenizer.model", "added_tokens.json",
+        ]
+        
+        for tf in tokenizer_files:
+            src = model_src / tf
+            if src.exists():
+                shutil.copy2(src, save_path / tf)
+        
+        # 3. 递归复制 tokenizer 子目录
+        tokenizer_dir = model_src / "tokenizer"
+        if tokenizer_dir.exists() and tokenizer_dir.is_dir():
+            shutil.copytree(tokenizer_dir, save_path / "tokenizer", dirs_exist_ok=True)
+        
+        # 4. 复制 generation_config.json
+        gen_config = model_src / "generation_config.json"
+        if gen_config.exists():
+            shutil.copy2(gen_config, save_path / "generation_config.json")
+        
+        logger.info(f"Successfully copied model files from {model_src} to {save_path}")
+        print(f"Successfully copied model files from {model_src} to {save_path}================")
+        
+        # 验证必要文件存在
+        required_files = ["config.json", "tokenizer.json"]
+        missing = [f for f in required_files if not (save_path / f).exists()]
+        if missing:
+            logger.warning(f"Missing files after copy: {missing}")
+    
+    # def _save_weights_as_hf_checkpoint(self, weights_dict: Dict[str, torch.Tensor], save_path: Path):
+    #     """
+    #     将权重字典保存为 HuggingFace checkpoint 格式
+    #     """
+    #     save_path.mkdir(parents=True, exist_ok=True)
+        
+    #     # 分离权重和 scale（如果已量化）
+    #     state_dict = {}
+    #     for name, tensor in weights_dict.items():
+    #         # 跳过 scale（msmodelslim 会从配置文件读取）
+    #         if name.endswith("_scale"):
+    #             continue
+    #         state_dict[name] = tensor
+        
+    #     # 保存权重
+    #     torch.save(state_dict, save_path / "pytorch_model.bin")
+        
+    #     # 复制配置文件（从本地路径）
+    #     if self.model_local_path:
+    #         config_files = ["config.json", "tokenizer_config.json", "tokenizer.json"]
+    #         for cfg_file in config_files:
+    #             src = Path(self.model_local_path) / cfg_file
+    #             if src.exists():
+    #                 shutil.copy2(src, save_path / cfg_file)
+
+    async def _run_msit_quantization_async(
+        self, 
+        input_path: Path, 
+        output_path: Path, 
+        config: Any
+    ):
+        """异步执行 msit 量化命令"""
+        # 构建 msit 命令
+        cmd = [
+            self.ms_modelslim_path,
+            "quant",
+            "--model_path", str(input_path),
+            "--save_path", str(output_path),
+            "--device", "npu",
+            "--model_type", self.model_config.architectures[0],
+            "--quant_type", "w8a8",
+            "--trust_remote_code", "True",
+            "--weight-format", "safetensors",
+        ]
+        
+        # 添加可选参数
+        if isinstance(config, dict):
+            if config.get('fast_mode', False):
+                cmd.append("--fast")
+            if config.get('calibration_samples', 0) > 0:
+                cmd.extend(["--calibration_samples", str(config['calibration_samples'])])
+        else:
+            if getattr(config, 'fast_mode', False):
+                cmd.append("--fast")
+            if getattr(config, 'calibration_samples', 0) > 0:
+                cmd.extend(["--calibration_samples", str(config.calibration_samples)])
+        
+        logger.info(f"Running msit quantization: {' '.join(cmd)}")
+        
+        # 异步执行（不阻塞事件循环）
+        loop = asyncio.get_event_loop()
+        try:
+            result = await loop.run_in_executor(
+                None,
+                lambda: subprocess.run(
+                    cmd,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=600
+                )
+            )
+            logger.info(f"msit quantization succeeded: {result.stdout}")
+        except subprocess.CalledProcessError as e:
+            logger.error(f"msit quantization failed: {e.stderr}")
+            raise RuntimeError(f"W8A8 quantization failed: {e.stderr}")
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("W8A8 quantization timed out after 10 minutes")
 
     def _run_msit_quantization(self, input_path: Path, output_path: Path, config: Any):
         """
@@ -392,6 +553,13 @@ class vLLMAsyncRollout(BaseRollout):
             output_path: 量化后模型保存路径
             config: 量化配置对象
         """
+        # logger.info(f"检查输出路径output_path: {output_path}=============in")
+        # logger.info(f"是否存在output_path: {output_path.exists()}============in")
+        # logger.info(f"检查输出路径input_path: {input_path}==========in")
+        # logger.info(f"是否存在input_path: {input_path.exists()}==========in")
+        # if input_path.exists():
+        #     for item in input_path.iterdir():
+        #         logger.info(f"  - {item.name} (dir: {item.is_dir()})")
         # 构建 msit 命令
         cmd = [
             self.ms_modelslim_path,  # 如 "python -m msit" 或 "msmodelslim"
@@ -425,33 +593,137 @@ class vLLMAsyncRollout(BaseRollout):
         except subprocess.TimeoutExpired:
             raise RuntimeError("W8A8 quantization timed out after 10 minutes")
 
-    def _load_quantized_weights(self, quantized_path: Path) -> Generator[Tuple[str, torch.Tensor], None, None]:
-        """
-        加载量化后的权重文件（mt-safe-tensors 格式）
-        
-        Returns:
-            权重生成器，符合 vLLM load_weights 接口
-        """
-        # msit 可能生成 .safetensors 或 .bin
-        weight_files = list(quantized_path.glob("*.safetensors")) or list(quantized_path.glob("pytorch_model.bin"))
-        
-        if not weight_files:
-            raise FileNotFoundError(f"No weight files found in {quantized_path}")
-        
-        # 加载权重
-        state_dict = {}
-        for wf in weight_files:
-            if wf.suffix == ".safetensors":
-                from safetensors import safe_open
-                with safe_open(wf, framework="pt", device="cpu") as f:
-                    for key in f.keys():
-                        state_dict[key] = f.get_tensor(key)
+        logger.info(f"检查输出路径output_path: {output_path}=============out")
+        logger.info(f"是否存在output_path: {output_path.exists()}============out")
+        logger.info(f"检查输出路径input_path: {input_path}==========out")
+        logger.info(f"是否存在input_path: {input_path.exists()}==========out")
+        if output_path.exists():
+            for item in output_path.iterdir():
+                logger.info(f"  - {item.name} (dir: {item.is_dir()})")
+
+    def _load_quantized_weights(
+        self, 
+        quant_path: Path
+    ) -> Generator[Tuple[str, torch.Tensor], None, None]:
+        print(f"=================quant_path:{quant_path}================3")
+        # import time
+        # time.sleep(120)
+        if quant_path.exists():
+            for item in quant_path.iterdir():
+                logger.info(f"  new- {item.name} (dir: {item.is_dir()})")
+        """从量化目录加载权重（支持 safetensors）"""
+        # 查找 safetensors 文件
+        # safetensor_files = sorted(quant_path.glob("*.safetensors"))
+        safetensor_files = [quant_path / "quant_model_weight_w8a8.safetensors"]
+        print(f"=================safetensor_files:{safetensor_files}================")
+        if not safetensor_files:
+            # 回退到 pytorch_model.bin
+            bin_files = list(quant_path.glob("*.bin"))
+            if bin_files:
+                state_dict = {}
+                for bf in bin_files:
+                    state_dict.update(torch.load(bf, map_location="cpu"))
+                for name, tensor in state_dict.items():
+                    yield name, tensor
+                return
             else:
-                state_dict.update(torch.load(wf, map_location="cpu"))
+                print(f"=================quant_path:{quant_path}================4")
+                raise FileNotFoundError(f"No weight files found in {quant_path}")
         
-        # 生成器形式返回
+        # 加载 safetensors
+        state_dict = {}
+        for sf in safetensor_files:
+            state_dict.update(load_file(sf, device="cpu"))
+
+        # for name, tensor in state_dict.items():
+        #     yield name, tensor
+
+        # vllm_state_dict = {}
+    
+        # for name, tensor in state_dict.items():
+        #     # 检测 MXFP8 权重（msit 使用 float8_e4m3fn）
+        #     if tensor.dtype == torch.float8_e4m3fn in name:
+        #         vllm_state_dict[name] = tensor  # 保持 MXFP8 类型
+                
+        #         # 查找对应的 scale（msit 生成的是 name + "_scale"）
+        #         scale_name = f"{name}_scale"
+        #         if scale_name in state_dict:
+        #             scale = state_dict[scale_name]
+                    
+        #             # vLLM 需要的 deq_scale（float32 类型）
+        #             # shape: [1] 或 [output_dim]，vLLM 会用它反量化
+        #             vllm_state_dict[f"{name}.deq_scale"] = scale.to(torch.float32)
+                    
+        #             logger.info(f"Added real MXFP8 deq_scale for {name}: shape={scale.shape}")
+            
+        #     # 普通权重直接复制
+        #     elif not name.endswith("_scale"):  # 跳过 scale 本身
+        #         vllm_state_dict[name] = tensor
+
+        # # 生成器返回
+        # for name, tensor in vllm_state_dict.items():
+        #     yield name, tensor
+
+        vllm_state_dict = {}
+    
         for name, tensor in state_dict.items():
+            # 跳过 scale/bias 本身
+            if any(name.endswith(suffix) for suffix in ["_scale", "_zero_point", "_quant_bias"]):
+                continue
+            
+            vllm_state_dict[name] = tensor
+            
+            # ===== 转换量化格式 =====
+            scale_name = f"{name}_scale"
+            if scale_name in state_dict:
+                scale = state_dict[scale_name].to(torch.float32)
+                
+                # 1. deq_scale（与 scale 相同）
+                vllm_state_dict[f"{name}.deq_scale"] = scale
+                
+                # 2. quant_bias（AWQ 格式要求，msit 未生成，伪造为 0）
+                # shape 与 scale 相同
+                vllm_state_dict[f"{name}.quant_bias"] = torch.zeros_like(scale)
+                
+                # 3. zero_point（AWQ 格式要求，通常也为 0）
+                vllm_state_dict[f"{name}.zero_point"] = torch.zeros_like(scale)
+                
+                logger.info(f"Converted {name} to AWQ format: +deq_scale, +quant_bias, +zero_point")
+        
+        logger.info(f"Converted {len(vllm_state_dict)} keys for vLLM")
+        
+        for name, tensor in vllm_state_dict.items():
             yield name, tensor
+        
+        
+
+    # def _load_quantized_weights(self, quantized_path: Path) -> Generator[Tuple[str, torch.Tensor], None, None]:
+    #     """
+    #     加载量化后的权重文件（mt-safe-tensors 格式）
+        
+    #     Returns:
+    #         权重生成器，符合 vLLM load_weights 接口
+    #     """
+    #     # msit 可能生成 .safetensors 或 .bin
+    #     weight_files = list(quantized_path.glob("*.safetensors")) or list(quantized_path.glob("pytorch_model.bin"))
+        
+    #     if not weight_files:
+    #         raise FileNotFoundError(f"No weight files found in {quantized_path}")
+        
+    #     # 加载权重
+    #     state_dict = {}
+    #     for wf in weight_files:
+    #         if wf.suffix == ".safetensors":
+    #             from safetensors import safe_open
+    #             with safe_open(wf, framework="pt", device="cpu") as f:
+    #                 for key in f.keys():
+    #                     state_dict[key] = f.get_tensor(key)
+    #         else:
+    #             state_dict.update(torch.load(wf, map_location="cpu"))
+        
+    #     # 生成器形式返回
+    #     for name, tensor in state_dict.items():
+    #         yield name, tensor
 
 
     def _quantize_weights_mxfp8(self, weights: Generator[Tuple[str, torch.Tensor], None, None], config) -> Generator[Tuple[str, torch.Tensor], None, None]:
